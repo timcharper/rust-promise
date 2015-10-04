@@ -11,14 +11,14 @@ use std::mem;
 
 #[derive(Clone)]
 pub struct Promise<T: Send+'static> {
-    pub data: Arc<UnsafeCell<Option<T>>>,
+    pub data: Arc<UnsafeCell<Option<Result<T, String>>>>,
     pub init: Latch,
     pub commit: Latch,
 }
 
 #[derive(Clone)]
-pub struct Promisee<T: Send+'static> {
-    pub p: Promise<T>,
+pub struct Future<T: Send+'static> {
+    pub p: Promise<T>, // TODO - make this private
     sink: Sender<Thread>,
 }
 
@@ -31,9 +31,10 @@ unsafe impl<T: Send> Send for Promise<T> {}
 unsafe impl<T: Sync + Send> Sync for Promise<T> {}
 
 impl<T: Send+'static> Promise<T> {
-    pub fn new () -> (Promiser<T>,Promisee<T>) {
+    pub fn new () -> (Promiser<T>,Future<T>) {
         let (t,r) = channel();
-        let d: Option<T> = None;
+        // TODO - add type for promise failure type
+        let d: Option<Result<T, String>> = None;
 
         let p = Promise { data: Arc::new(UnsafeCell::new(d)),
                           init: Latch::new(),
@@ -42,7 +43,7 @@ impl<T: Send+'static> Promise<T> {
         let p2 = p.clone();
         let pt = Promiser { p: p,
                             sink: r };
-        let pr = Promisee { p: p2,
+        let pr = Future { p: p2,
                             sink: t };
 
         (pt,pr)
@@ -54,10 +55,10 @@ impl<T: Send+'static> Promise<T> {
                   commit: self.commit.clone(),}
     }
 
-    fn _deliver (&self, d:Option<T>) -> bool {
+    fn _deliver (&self, d:Result<T, String>) -> bool {
         if self.init.close() {
             let w = self.data.get();
-            unsafe{ *w = d; }
+            unsafe{ *w = Some(d); }
             self.commit.close();
             return true
         }
@@ -66,16 +67,21 @@ impl<T: Send+'static> Promise<T> {
     }
 
     pub fn deliver (&self, d:T) -> bool {
-        self._deliver(Some(d))
+        self._deliver(Ok(d))
     }
 
-    ///should be called only from promiser/promisee-- public for now tho
+    pub fn fail (&self, d: String) -> bool {
+        self._deliver(Err(d))
+    }
+
+    ///should be called only from promiser/future-- public for now tho
     pub fn _with<W,F:FnMut(&T)->W> (&self, mut f:F) -> Result<W,String> {
         let v = self.data.get();
 
         unsafe {
             match *v {
-                Some(ref r) => Ok(f(&*r)),
+                Some(Ok(ref r)) => Ok(f(&*r)),
+                Some(Err(ref s)) => Err(s.clone()),
                 None => Err("promise signaled early, value not present!".to_string()),
             }
         }
@@ -83,7 +89,7 @@ impl<T: Send+'static> Promise<T> {
 
  
     pub fn destroy (&self) -> Result<String,String> {
-        if self._deliver(None) {
+        if self._deliver(Err("destroyed".to_owned())) {
             Ok("Promise signaled early".to_string())
         }
         else { Err("promise already delivered".to_string()) }
@@ -104,6 +110,14 @@ impl<T: Send+'static> Drop for Promise<T> {
 impl<T: Send+'static> Promiser<T> {
     pub fn deliver (&self, d:T) -> bool {
         let r  = self.p.deliver(d);
+
+        self.wakeup();
+
+        r
+    }
+
+    pub fn fail(&self, s: String) -> bool {
+        let r = self.p.fail(s);
 
         self.wakeup();
 
@@ -131,7 +145,7 @@ impl<T: Send+'static> Drop for Promiser<T> {
 }
 
 
-impl<T: Send+'static> Promisee<T> {
+impl<T: Send+'static> Future<T> {
     pub fn with<W,F:FnMut(&T)->W> (&self,f:F) -> Result<W,String> {
         match self.wait() {
             Ok(_) => self.p._with(f),
@@ -168,21 +182,20 @@ impl<T: Send+'static> Promisee<T> {
             if self.p.commit.latched() { //finalized?
                 let d = self.p.data.get();
                 unsafe {
-                    let r = match *d {
-                        Some(_) => true,
-                        None => false,
-                    };
-                    if r { Ok(mem::transmute(&*d)) }
-                    else { Err("promise signaled early, value not present!".to_string()) }
+                    match *d {
+                        Some(Ok(ref d)) => Ok(mem::transmute(&*d)),
+                        Some(Err(ref s)) => Err(s.clone()),
+                        None => Err("promise signaled early, value not present!".to_string()),
+                    }
                 }
             }
             else { Ok(None) } //not finalized
         }
     }
 
-    pub fn clone(&self) -> Promisee<T> {
-        Promisee { p: self.p.clone(),
-                   sink: self.sink.clone(), }
+    pub fn clone(&self) -> Future<T> {
+        Future { p: self.p.clone(),
+                 sink: self.sink.clone(), }
     }
 }
 
