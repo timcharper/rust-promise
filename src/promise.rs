@@ -153,6 +153,30 @@ impl<T: Send+'static> Future<T> {
         }
     }
 
+    pub fn map<W: Send + 'static, F: FnOnce(&T)->W> (&self, map_fn: F) -> Future<W> {
+        let (promise, future) = Promise::new();
+        match self.wait() {
+            Ok(_) => {
+                let value = self.p.data.get();
+                unsafe {
+                    match *value {
+                        Some(Ok(ref r)) => {
+                            promise.deliver(map_fn(r));
+                        }
+                        Some(Err(ref s)) => {
+                            promise.fail(s.clone());
+                        }
+                        None => {
+                            promise.fail("not ready yet".to_owned());
+                        }
+                    }
+                }
+            },
+            Err(_) => ()//promise.fail("hi".to_owned()),
+        }
+        future
+    }
+
     pub fn wait(&self) -> Result<(),String> {
         if !self.p.commit.latched() { //not finalized?
             if !self.p.init.latched() { //has it been locked?
